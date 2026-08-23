@@ -759,7 +759,8 @@ int main(int argc, char *argv[])
   prepare_scc(scc);
   uint64_t ssb_bitmap;
   fill_scc_sim(scc, &ssb_bitmap, N_RB_DL, N_RB_DL, mu, mu);
-  fix_scc(scc,ssb_bitmap);
+  // No gNB YAML here: pass default coreset_duration=1 (same as gNB config default).
+  fix_scc(scc,ssb_bitmap,1);
 
   frame_structure_t frame_structure = {0};
   frame_type_t frame_type = TDD;
@@ -789,7 +790,8 @@ int main(int argc, char *argv[])
                                 .timer_config.t311 = 3000,
                                 .timer_config.n311 = 1,
                                 .timer_config.t319 = 400,
-                                .spatial_stream_index = {0, 1, 2, 3, 4, 5, 6, 7}};
+                                .spatial_stream_index = {0, 1, 2, 3, 4, 5, 6, 7},
+                                .coreset_duration = 1};
   const nr_rlc_configuration_t rlc_config = {
     .srb = {
       .t_poll_retransmit = 45,

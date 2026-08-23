@@ -62,7 +62,7 @@ void nr_schedule_ue_spec(module_id_t module_id,
                          nfapi_nr_dl_tti_request_t *DL_req,
                          nfapi_nr_tx_data_request_t *TX_req);
 
-/* \brief default DL preprocessor */
+/* \brief DL preprocessor — branches to nr_dl_schedule_ns() or nr_dl_schedule() per scheduler_type_dl */
 void nr_dlsch_preprocessor(gNB_MAC_INST *mac, post_process_pdsch_t *pp_pdsch);
 
 void schedule_nr_sib1(module_id_t module_idP,
@@ -88,6 +88,9 @@ void nr_schedule_ulsch(module_id_t module_id, frame_t frame, slot_t slot, nfapi_
 
 /* \brief default UL preprocessor */
 void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, post_process_pusch_t *pp_pusch);
+
+/* \brief bind pre_processor_dl/ul after slice / scheduler YAML is loaded */
+void nr_mac_init_scheduler(gNB_MAC_INST *mac);
 
 int check_sc_fdma_rbsize(long transform_precoding, uint16_t rb);
 
@@ -465,6 +468,26 @@ bool get_rb_alloc(int rbSize_min,
                   int *rbStart_ptr,
                   int *rbSize_ptr);
 
+/* Map absolute slice PRB range → BWP-relative bounds for get_rb_alloc_slice(). */
+void nr_slice_rb_bounds(int slice_rb_start,
+                        int slice_rb_end,
+                        int bwp_start,
+                        int bwp_size,
+                        int *slice_start_rel,
+                        int *slice_end_rel);
+
+/* Slice-bounded RB search; slice_start_rel < 0 selects the full UE BWP. */
+bool get_rb_alloc_slice(int rbSize_min,
+                        int rbSize_max,
+                        int bwpStart,
+                        int bwpSize,
+                        const uint16_t *vrb_map,
+                        uint16_t sym_mask,
+                        int slice_start_rel,
+                        int slice_end_rel,
+                        int *rbStart_ptr,
+                        int *rbSize_ptr);
+
 /* Scalar core of the BLER -> MCS adaptation rule. Single source of truth
  * for the activity-guard threshold and the lower/upper hysteresis. */
 int nr_adapt_mcs_from_bler(int current_mcs,
@@ -549,6 +572,10 @@ void reset_sc_info(NR_UE_ServingCell_Info_t *sc_info);
 bool nr_mac_add_lcid(NR_UE_sched_ctrl_t *sched_ctrl, const nr_lc_config_t *c);
 nr_lc_config_t *nr_mac_get_lc_config(NR_UE_sched_ctrl_t* sched_ctrl, int lcid);
 bool nr_mac_remove_lcid(NR_UE_sched_ctrl_t *sched_ctrl, long lcid);
+void nr_mac_get_default_srb_nssai(nssai_t *nssai);
+bool nr_mac_get_ue_first_drb_nssai(const NR_UE_sched_ctrl_t *sched_ctrl, nssai_t *nssai);
+void nr_mac_get_ue_effective_nssai(const NR_UE_sched_ctrl_t *sched_ctrl, nssai_t *nssai);
+void nr_mac_remap_ue_srbs_to_nssai(NR_UE_sched_ctrl_t *sched_ctrl, const nssai_t *nssai);
 
 bool nr_mac_get_new_rnti(NR_UEs_t *UEs, rnti_t *rnti);
 void nr_mac_update_pdcch_closed_loop_adjust(NR_UE_sched_ctrl_t *sched_ctrl, bool feedback_not_detected);
