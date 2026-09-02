@@ -524,7 +524,7 @@ int nr_mac_soft_dci_budget_per_dir(const nr_cell_sched_t *cell)
    * permanently starved when budget < N. get_cce_index() remains the hard stop.
    * `cell` reserved for future TDD/PUCCH-aware sizing. */
   (void)cell;
-  const int soft_budget = 4;
+  const int soft_budget = 8;
   return soft_budget < MAX_DCI_CORESET ? soft_budget : MAX_DCI_CORESET;
 }
 

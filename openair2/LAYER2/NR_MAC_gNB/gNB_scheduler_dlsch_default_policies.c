@@ -216,6 +216,10 @@ static bool nr_dl_get_rb_alloc(const nr_dl_sched_params_t *params,
                      cand->bwp_size,
                      &slice_start,
                      &slice_end);
+  if (slice_start >= slice_end && cand->bwp_size > 0) {
+    slice_start = 0;
+    slice_end = cand->bwp_size;
+  }
   return get_rb_alloc_slice(rbSize_min,
                             rbSize_max,
                             cand->bwp_start,
