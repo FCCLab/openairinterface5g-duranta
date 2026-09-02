@@ -2140,6 +2140,7 @@ static int compare_ul_beam_idx(const void *a, const void *b)
   return ((const nr_ul_candidate_t *)a)->alloc_beam_idx - ((const nr_ul_candidate_t *)b)->alloc_beam_idx;
 }
 
+/*! \brief Modular UL scheduler pipeline (RI/TPMI → beam → TDA → MCS → RB → dispatch). */
 static int nr_ul_schedule(gNB_MAC_INST *nrmac,
                           nr_cell_sched_t *cell,
                           post_process_pusch_t *pp_pusch,
@@ -2153,7 +2154,7 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
                           int k2)
 {
   int frame = pp_pusch->frame;
-  int slot = pp_pusch->slot;
+  slot_t slot = pp_pusch->slot;
   NR_ServingCellConfigCommon_t *scc = cell->common_channels.ServingCellConfigCommon;
   int slots_per_frame = cell->frame_structure.numb_slots_frame;
 
@@ -2185,16 +2186,13 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
     return 0;
 
   const int min_rb = cell->min_grant_prb;
-  int remainUEs[num_beams];
-  for (int i = 0; i < num_beams; i++)
-    remainUEs[i] = max_num_ue;
   int num_ue_sched = 0;
 
   /* Step 5: MCS selection — updates BLER-based MCS for all candidates
    * (including skipped ones, so the BLER ramp evolves even for unscheduled UEs). */
   nrmac->ul_mcs_select(cell, candidates, n_cand);
 
-  /* Step 6: Sort by beam, then call RB allocation policy per beam */
+  /* Step 6: RB allocation policy per beam */
   qsort(candidates, n_cand, sizeof(*candidates), compare_ul_beam_idx);
 
   nr_ul_sched_params_t params = {
@@ -2212,6 +2210,8 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
       .bler_upper = cell->ul_bler.upper,
       .bler_opts = &cell->ul_bler,
       .scc = scc,
+      .slice_rb_start = -1,
+      .slice_rb_end = -1,
   };
   const int index = ul_buffer_index(sched_frame, sched_slot, slots_per_frame, cell->vrb_map_UL_size);
   for (int b = 0; b < num_beams; b++) {
@@ -2231,6 +2231,32 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
     int count = i - start;
 
     nrmac->ul_rb_alloc(&params, candidates + start, count);
+  }
+
+  /* Under NS, abort HARQ only when the slice max can never hold this retx.
+   * A miss this slot (max_num_ue, CCE, moving slice window) must retry next TTI.
+   * Aborting every miss kills SRB/DRB after a few slots and takes the UE to RLF. */
+  if (nrmac->scheduler_type_ul == SCHE_NS) {
+    for (int j = 0; j < n_cand; j++) {
+      nr_ul_candidate_t *cand = &candidates[j];
+      if (!cand->is_retx || cand->scheduled || cand->skipped)
+        continue;
+      if (!nr_ns_retx_exceeds_slice_max(nrmac->slice_scheduler_ul, cand->UE, cand->retx_rbSize))
+        continue;
+      NR_UE_sched_ctrl_t *sched_ctrl = &cand->UE->UE_sched_ctrl;
+      int harq_pid = cand->retx_harq_pid;
+      LOG_D(NR_MAC,
+            "[UE %04x][%4d.%2d] UL retransmission %d PRBs exceeds slice max (abort HARQ)\n",
+            cand->rnti,
+            frame,
+            slot,
+            cand->retx_rbSize);
+      reset_beam_status(&cell->beam_info, frame, slot, cand->beam_index, slots_per_frame, cand->alloc_dci_beam_new);
+      reset_beam_status(&cell->beam_info, sched_frame, sched_slot, cand->beam_index, slots_per_frame, cand->alloc_sched_beam_new);
+      remove_nr_list(&sched_ctrl->retrans_ul_harq, harq_pid);
+      abort_nr_ul_harq(cand->UE, harq_pid);
+      cand->skipped = true;
+    }
   }
 
   /* Release beam reservations for candidates the policy rejected (failed
@@ -2304,7 +2330,6 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
 
 
     n_rb_sched[beam_idx] -= rbSize_used;
-    remainUEs[beam_idx]--;
     num_ue_sched++;
   }
 
@@ -2780,6 +2805,7 @@ static int collect_ul_candidates(gNB_MAC_INST *mac,
 
 void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_process_pusch_t *pp_pusch)
 {
+  /* Outer loop: for each reachable UL slot (K2), collect once, then run nr_ul_schedule(). */
   int frame = pp_pusch->frame;
   int slot = pp_pusch->slot;
 
@@ -2795,9 +2821,13 @@ void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_pro
   int num_beams = cell->beam_info.beam_allocation ? cell->beam_info.beams_per_period : 1;
   int bw = scc->uplinkConfigCommon->frequencyInfoUL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth;
 
-  // FAPI cannot handle more than MAX_DCI_CORESET DCIs
-  static_assert(4 < MAX_DCI_CORESET, "cannot have more concurrent UEs than MAX_DCI_CORESET\n");
-  int max_dci = 4;
+  /* Soft budget per direction; MAX_DCI_CORESET is FAPI array size only.
+   * On DL slots leave ≥1 seat for subsequent nr_schedule_ue_spec() so UL
+   * min-grants cannot consume the entire soft budget before DL data/SRB. */
+  static_assert(MAX_DCI_CORESET >= 1, "MAX_DCI_CORESET must be positive");
+  int max_dci = nr_mac_soft_dci_budget_per_dir(cell);
+  if (is_dl_slot(slot, fs) && max_dci > 1)
+    max_dci -= 1;
 
   fsn_t current = {frame, slot, *scc->ssbSubcarrierSpacing};
   fsn_t min_next = fsn_add_delta(current, min_rxtx);
@@ -2854,6 +2884,7 @@ void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_pro
     int len[num_beams];
     for (int i = 0; i < num_beams; i++)
       len[i] = bw;
+
     int sched = nr_ul_schedule(nr_mac, cell, pp_pusch, candidates, n_cand, max_dci, num_beams, len, sched_frame, sched_slot, k2);
     LOG_D(NR_MAC,
           "run nr_ul_schedule() at %4d.%2d k2 %d (ULSCH at %4d.%2d) scheduled %d last_dl %d\n",
@@ -2864,6 +2895,7 @@ void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_pro
           next->s,
           sched,
           last_dl);
+
     /* if we did not schedule anything, and it's not the last slot, break. In
      * the case we did schedule or it's the last slot (see above!), continue
      * advancing till there is no TDA anymore */

@@ -749,15 +749,20 @@ static bool get_cw_info(NR_UE_DL_HARQ_STATUS_t *current_harq,
                                   0,
                                   cw_info->Nl);
     // storing for possible retransmissions
-    if (!cw_info->new_data_indicator && current_harq->TBS != cw_info->TBS) {
+    if (!cw_info->new_data_indicator && current_harq->TBS != 0 && current_harq->TBS != cw_info->TBS) {
       LOG_W(NR_MAC,
-            "NDI indicates re-transmission but computed TBS %d doesn't match with what previously stored %d\n",
+            "NDI indicates re-transmission but computed TBS %d doesn't match with what previously stored %d — keep stored TBS\n",
             cw_info->TBS,
             current_harq->TBS);
-      cw_info->new_data_indicator = true; // treated as new data
+      /* Keep the original TB size/rate. Flipping to "new data" used to poison
+       * HARQ and cause oscillating mismatches; dropping the grant stalled
+       * retx and drove RLF. */
+      cw_info->TBS = current_harq->TBS;
+      cw_info->targetCodeRate = current_harq->R;
+    } else {
+      current_harq->R = cw_info->targetCodeRate;
+      current_harq->TBS = cw_info->TBS;
     }
-    current_harq->R = cw_info->targetCodeRate;
-    current_harq->TBS = cw_info->TBS;
   }
   else {
     cw_info->targetCodeRate = current_harq->R;

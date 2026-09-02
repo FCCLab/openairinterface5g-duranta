@@ -823,6 +823,8 @@ typedef struct {
 //table 3-37 
 
 #define DCI_PAYLOAD_BYTE_LEN 8 // 12 ? TS38.212 sec 7.3.1
+/* FAPI array size for DCIs in one PDCCH PDU. Not the MAC soft schedule budget —
+ * see nr_mac_soft_dci_budget_per_dir(). */
 #define MAX_DCI_CORESET 12
 
 typedef struct {

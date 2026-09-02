@@ -21,6 +21,7 @@ int nr_dl_beam_select_default(NR_beam_info_t *beam_info,
 int nr_dl_tda_select_default(const gNB_MAC_INST *mac, const nr_cell_sched_t *cell, nr_dl_candidate_t *candidates, int n_candidates, frame_t frame, slot_t slot);
 
 int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
+int nr_dl_slice_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
 
 void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
                               const nr_dl_candidate_t *candidate,

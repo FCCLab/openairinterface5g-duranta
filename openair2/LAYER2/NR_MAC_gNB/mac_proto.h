@@ -93,6 +93,9 @@ void nr_schedule_ulsch(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, frame_t fram
 /* \brief default UL preprocessor */
 void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_process_pusch_t *pp_pusch);
 
+/* \brief bind pre_processor_dl/ul after slice / scheduler YAML is loaded */
+void nr_mac_init_scheduler(gNB_MAC_INST *mac);
+
 int check_sc_fdma_rbsize(long transform_precoding, uint16_t rb);
 
 void nr_mac_pcch_queue_init(NR_COMMON_channels_t *cc);
@@ -436,6 +439,10 @@ int get_cce_index(const nr_cell_sched_t *cell,
                   NR_sched_pdcch_t *sched_pdcch,
                   float pdcch_cl_adjust);
 
+/*! Soft per-direction DCI budget for one slot (≤ MAX_DCI_CORESET).
+ *  PUCCH-safe cap for TDD; not the FAPI array size. */
+int nr_mac_soft_dci_budget_per_dir(const nr_cell_sched_t *cell);
+
 bool nr_find_nb_rb(uint16_t Qm,
                    uint16_t R,
                    long transform_precoding,
@@ -470,6 +477,30 @@ bool get_rb_alloc(int rbSize_min,
                   uint16_t sym_mask,
                   int *rbStart_ptr,
                   int *rbSize_ptr);
+
+/* Map absolute slice PRB range → BWP-relative bounds for get_rb_alloc_slice(). */
+void nr_slice_rb_bounds(int slice_rb_start,
+                        int slice_rb_end,
+                        int bwp_start,
+                        int bwp_size,
+                        int *slice_start_rel,
+                        int *slice_end_rel);
+
+/* True when this HARQ retx can never fit in the UE's slice max_prb_ratio.
+ * Transient misses (CCE, max_num_ue, this-slot window) must NOT abort HARQ. */
+bool nr_ns_retx_exceeds_slice_max(const slice_scheduler_t *ss, const NR_UE_info_t *UE, int retx_rbSize);
+
+/* Slice-bounded RB search; slice_start_rel < 0 selects the full UE BWP. */
+bool get_rb_alloc_slice(int rbSize_min,
+                        int rbSize_max,
+                        int bwpStart,
+                        int bwpSize,
+                        const uint16_t *vrb_map,
+                        uint16_t sym_mask,
+                        int slice_start_rel,
+                        int slice_end_rel,
+                        int *rbStart_ptr,
+                        int *rbSize_ptr);
 
 /* Scalar core of the BLER -> MCS adaptation rule. Single source of truth
  * for the activity-guard threshold and the lower/upper hysteresis. */
@@ -547,6 +578,7 @@ void clean_bwp_structures(NR_SpCellConfig_t *spCellConfig);
 bool nr_mac_ue_is_active(const NR_UE_info_t *ue);
 
 void nr_mac_trigger_ul_failure(NR_UE_sched_ctrl_t *sched_ctrl, NR_SubcarrierSpacing_t subcarrier_spacing);
+void nr_mac_register_gnb_rlc_rlf_handler(int rnti);
 void nr_mac_reset_ul_failure(NR_UE_sched_ctrl_t *sched_ctrl);
 bool nr_mac_check_ul_failure(gNB_MAC_INST *nrmac, int rnti, NR_UE_sched_ctrl_t *sched_ctrl);
 
@@ -555,6 +587,10 @@ void reset_sc_info(NR_UE_ServingCell_Info_t *sc_info);
 bool nr_mac_add_lcid(NR_UE_sched_ctrl_t *sched_ctrl, const nr_lc_config_t *c);
 nr_lc_config_t *nr_mac_get_lc_config(NR_UE_sched_ctrl_t* sched_ctrl, int lcid);
 bool nr_mac_remove_lcid(NR_UE_sched_ctrl_t *sched_ctrl, long lcid);
+void nr_mac_get_default_srb_nssai(nssai_t *nssai);
+bool nr_mac_get_ue_first_drb_nssai(const NR_UE_sched_ctrl_t *sched_ctrl, nssai_t *nssai);
+void nr_mac_get_ue_effective_nssai(const NR_UE_sched_ctrl_t *sched_ctrl, nssai_t *nssai);
+void nr_mac_remap_ue_srbs_to_nssai(NR_UE_sched_ctrl_t *sched_ctrl, const nssai_t *nssai);
 
 bool nr_mac_get_new_rnti(NR_UEs_t *UEs, rnti_t *rnti);
 void nr_mac_update_pdcch_closed_loop_adjust(NR_UE_sched_ctrl_t *sched_ctrl, bool feedback_not_detected);

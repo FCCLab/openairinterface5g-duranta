@@ -902,7 +902,8 @@ static int config_sched_ctrlSIB1(nr_cell_sched_t *cell)
                                                 cell->cset0_bwp_size,
                                                 bwp_start,
                                                 bwp_size,
-                                                do_TCI);
+                                                do_TCI,
+                                                cell->radio_config.coreset_duration);
   }
   return num_symb_cset;
 }
@@ -979,11 +980,28 @@ void nr_mac_config_scc(gNB_MAC_INST *nrmac, nr_cell_sched_t *cell, NR_ServingCel
 
   const nr_mac_config_t *rc = &cell->radio_config;
   const NR_DownlinkConfigCommon_t *dlcc = scc->downlinkConfigCommon;
+  /* Connected UEs on the initial BWP use this SCC PDSCH TDA list together with
+   * a dedicated CORESET whose duration comes from YAML (coreset_duration).
+   * CORESET0 alone may be shorter (e.g. 1 symbol for controlResourceSetZero=10).
+   * If TDA still starts at CORESET0 length while dedicated CORESET is longer,
+   * PDCCH and PDSCH overlap → decode failure → RLF under load.
+   * Align TDA start with the longer of CORESET0 and dedicated CORESET. */
+  int len_coreset_for_tda = num_symb_cset;
+  if (rc->coreset_duration >= 1 && rc->coreset_duration <= 3
+      && rc->coreset_duration > len_coreset_for_tda)
+    len_coreset_for_tda = rc->coreset_duration;
+  if (len_coreset_for_tda != num_symb_cset)
+    LOG_I(NR_MAC,
+          "DL TDA uses coreset length %d (CORESET0 %d, dedicated coreset_duration %d)\n",
+          len_coreset_for_tda,
+          num_symb_cset,
+          rc->coreset_duration);
+
   nr_rrc_config_dl_tda(dlcc->initialDownlinkBWP->pdsch_ConfigCommon->choice.setup->pdsch_TimeDomainAllocationList,
                        get_frame_type((int)*dlcc->frequencyInfoDL->frequencyBandList.list.array[0], *scc->ssbSubcarrierSpacing),
                        scc->tdd_UL_DL_ConfigurationCommon,
                        csi_symbols_in_slot(scc),
-                       num_symb_cset);
+                       len_coreset_for_tda);
   nr_rrc_config_ul_tda(scc, rc->minRXTXTIME, rc->do_SRS);
   seq_arr_init(&cell->ul_tda, sizeof(NR_tda_info_t));
   init_ul_tda_info(scc->uplinkConfigCommon->initialUplinkBWP->pusch_ConfigCommon->choice.setup->pusch_TimeDomainAllocationList, &cell->ul_tda);
