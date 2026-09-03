@@ -30,5 +30,6 @@ int nr_ul_beam_select_default(NR_beam_info_t *beam_info,
 void nr_ul_mcs_select_default(const nr_cell_sched_t *cell, nr_ul_candidate_t *candidates, int n_candidates);
 
 int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_t *candidates, int n_candidates);
+int nr_ul_slice_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_t *candidates, int n_candidates);
 
 #endif /* GNB_SCHEDULER_ULSCH_DEFAULT_POLICIES_H */

@@ -270,7 +270,8 @@ static NR_ControlResourceSet_t *get_coreset_config(int bwp_id,
                                                    int bwp_start,
                                                    int bwp_size,
                                                    uint64_t ssb_bitmap,
-                                                   bool doTCI)
+                                                   bool doTCI,
+                                                   int coreset_duration)
 {
   NR_ControlResourceSet_t *coreset = calloc(1, sizeof(*coreset));
   AssertFatal(coreset != NULL, "out of memory\n");
@@ -302,7 +303,12 @@ static NR_ControlResourceSet_t *get_coreset_config(int bwp_id,
   }
   coreset->frequencyDomainResources.size = 6;
   coreset->frequencyDomainResources.bits_unused = 3;
-  coreset->duration = (eff_bwp_size < 48) ? 2 : 1;
+  /* Prefer gNB YAML coreset_duration (1..3). Fall back to the old BWP-size
+   * heuristic only if the caller passes an invalid value. */
+  if (coreset_duration >= 1 && coreset_duration <= 3)
+    coreset->duration = coreset_duration;
+  else
+    coreset->duration = (eff_bwp_size < 48) ? 2 : 1;
   coreset->cce_REG_MappingType.present = NR_ControlResourceSet__cce_REG_MappingType_PR_nonInterleaved;
   coreset->precoderGranularity = NR_ControlResourceSet__precoderGranularity_sameAsREG_bundle;
 
@@ -1049,19 +1055,32 @@ void nr_rrc_config_dl_tda(NR_PDSCH_TimeDomainResourceAllocationList_t *pdsch_Tim
                           int csi_symbols,
                           int len_coreset)
 {
+  /* Replace any placeholder TDAs from SCC construction (e.g. gnb_config.c
+   * SLIV 54 = start 1). get_dl_tda() returns 0/1/2 into this list — appending
+   * would leave the stale start=1 row at index 0 and overlap a 2-symbol CORESET. */
+  while (pdsch_TimeDomainAllocationList->list.count > 0) {
+    asn_sequence_del(&pdsch_TimeDomainAllocationList->list, 0, 1 /* free */);
+  }
+
   // setting default TDA for DL with TDA index 0
   NR_PDSCH_TimeDomainResourceAllocation_t *timedomainresourceallocation = CALLOC(1, sizeof(NR_PDSCH_TimeDomainResourceAllocation_t));
   // k0: Slot offset between DCI and its scheduled PDSCH (see TS 38.214 clause 5.1.2.1) When the field is absent the UE applies the value 0.
   //timedomainresourceallocation->k0 = calloc(1,sizeof(*timedomainresourceallocation->k0));
   //*timedomainresourceallocation->k0 = 0;
   timedomainresourceallocation->mappingType = NR_PDSCH_TimeDomainResourceAllocation__mappingType_typeA;
-  timedomainresourceallocation->startSymbolAndLength = get_SLIV(len_coreset,14-len_coreset); // basic slot configuration starting in symbol 1 til the end of the slot
+  timedomainresourceallocation->startSymbolAndLength = get_SLIV(len_coreset,14-len_coreset); // basic slot configuration starting after CORESET til the end of the slot
   asn1cSeqAdd(&pdsch_TimeDomainAllocationList->list, timedomainresourceallocation);
+  LOG_I(NR_MAC, "DL TDA index 0: start %d length %d (after coreset %d)\n", len_coreset, 14 - len_coreset, len_coreset);
   // setting TDA for CSI-RS symbol with index 1
   NR_PDSCH_TimeDomainResourceAllocation_t *timedomainresourceallocation1 = CALLOC(1,sizeof(NR_PDSCH_TimeDomainResourceAllocation_t));
   timedomainresourceallocation1->mappingType = NR_PDSCH_TimeDomainResourceAllocation__mappingType_typeA;
   timedomainresourceallocation1->startSymbolAndLength = get_SLIV(len_coreset, 14 - len_coreset - csi_symbols); // CSI-RS symbols
   asn1cSeqAdd(&pdsch_TimeDomainAllocationList->list, timedomainresourceallocation1);
+  LOG_I(NR_MAC,
+        "DL TDA index 1: start %d length %d (CSI-RS reserved %d)\n",
+        len_coreset,
+        14 - len_coreset - csi_symbols,
+        csi_symbols);
   if(frame_type == TDD) {
     if(tdd_UL_DL_ConfigurationCommon) {
       int dl_symb = 0;
@@ -1075,12 +1094,18 @@ void nr_rrc_config_dl_tda(NR_PDSCH_TimeDomainResourceAllocationList_t *pdsch_Tim
       } else if (tdd_UL_DL_ConfigurationCommon->pattern2) {
         dl_symb = tdd_UL_DL_ConfigurationCommon->pattern2->nrofDownlinkSymbols;
       }
-      if(dl_symb > 1) {
+      if (dl_symb > len_coreset) {
         // mixed slot TDA with TDA index 2
         NR_PDSCH_TimeDomainResourceAllocation_t *timedomainresourceallocation2 = CALLOC(1,sizeof(NR_PDSCH_TimeDomainResourceAllocation_t));
         timedomainresourceallocation2->mappingType = NR_PDSCH_TimeDomainResourceAllocation__mappingType_typeA;
-        timedomainresourceallocation2->startSymbolAndLength = get_SLIV(len_coreset,dl_symb-len_coreset); // mixed slot configuration starting in symbol 1 til the end of the dl allocation
+        timedomainresourceallocation2->startSymbolAndLength = get_SLIV(len_coreset,dl_symb-len_coreset); // after CORESET through end of DL portion
         asn1cSeqAdd(&pdsch_TimeDomainAllocationList->list, timedomainresourceallocation2);
+        LOG_I(NR_MAC, "DL TDA index 2: start %d length %d (mixed slot dl_symb %d)\n", len_coreset, dl_symb - len_coreset, dl_symb);
+      } else if (dl_symb > 1) {
+        LOG_W(NR_MAC,
+              "Mixed-slot DL symbols %d <= coreset length %d: skipping mixed-slot PDSCH TDA\n",
+              dl_symb,
+              len_coreset);
       }
     }
   }
@@ -1806,7 +1831,14 @@ static NR_BWP_Downlink_t *config_downlinkBWP(const NR_ServingCellConfigCommon_t 
   int bwp_size = NRRIV2BW(bwp->bwp_Common->genericParameters.locationAndBandwidth, MAX_BWP_SIZE);
   int bwp_start = NRRIV2PRBOFFSET(bwp->bwp_Common->genericParameters.locationAndBandwidth, MAX_BWP_SIZE);
   uint64_t ssb_bitmap = get_ssb_bitmap(scc);
-  NR_ControlResourceSet_t *coreset = get_coreset_config(bwp->bwp_Id, 0, 0, bwp_start, bwp_size, ssb_bitmap, configuration->do_TCI);
+  NR_ControlResourceSet_t *coreset = get_coreset_config(bwp->bwp_Id,
+                                                        0,
+                                                        0,
+                                                        bwp_start,
+                                                        bwp_size,
+                                                        ssb_bitmap,
+                                                        configuration->do_TCI,
+                                                        configuration->coreset_duration);
   bwp->bwp_Common->pdcch_ConfigCommon->choice.setup->commonControlResourceSet = coreset;
 
   bwp->bwp_Common->pdcch_ConfigCommon->choice.setup->searchSpaceZero=NULL;
@@ -1860,7 +1892,14 @@ static NR_BWP_Downlink_t *config_downlinkBWP(const NR_ServingCellConfigCommon_t 
   bwp->bwp_Dedicated->pdcch_Config->choice.setup->controlResourceSetToAddModList = calloc(1,sizeof(*bwp->bwp_Dedicated->pdcch_Config->choice.setup->controlResourceSetToAddModList));
 
   // coreset2 is identical to coreset above, but reallocated to prevent double frees
-  NR_ControlResourceSet_t *coreset2 = get_coreset_config(bwp->bwp_Id, 0, 0, bwp_start, bwp_size, ssb_bitmap, configuration->do_TCI);
+  NR_ControlResourceSet_t *coreset2 = get_coreset_config(bwp->bwp_Id,
+                                                         0,
+                                                         0,
+                                                         bwp_start,
+                                                         bwp_size,
+                                                         ssb_bitmap,
+                                                         configuration->do_TCI,
+                                                         configuration->coreset_duration);
   asn1cSeqAdd(&bwp->bwp_Dedicated->pdcch_Config->choice.setup->controlResourceSetToAddModList->list, coreset2);
   int rrc_num_agg_level_candidates[NUM_PDCCH_AGG_LEVELS];
   int num_cces = get_coreset_num_cces(coreset2->frequencyDomainResources.buf, coreset2->duration);
@@ -2776,9 +2815,11 @@ int configure_coreset_for_mux23(const NR_ServingCellConfigCommon_t *scc,
                                  int limit,
                                  int bwp_start,
                                  int bwp_size,
-                                 bool do_TCI)
+                                 bool do_TCI,
+                                 int coreset_duration)
 {
-  NR_ControlResourceSet_t *coreset = get_coreset_config(5, offset, limit, bwp_start, bwp_size, get_ssb_bitmap(scc), do_TCI);
+  NR_ControlResourceSet_t *coreset =
+      get_coreset_config(5, offset, limit, bwp_start, bwp_size, get_ssb_bitmap(scc), do_TCI, coreset_duration);
   NR_DownlinkConfigCommon_t *dlcc = scc->downlinkConfigCommon;
   NR_PDCCH_ConfigCommon_t *pdcch_common = dlcc->initialDownlinkBWP->pdcch_ConfigCommon->choice.setup;
   pdcch_common->commonControlResourceSet = coreset;
@@ -3424,7 +3465,14 @@ static NR_BWP_DownlinkDedicated_t *configure_initial_dl_bwp(const NR_ServingCell
   NR_BWP_t *genericParameters = &scc->downlinkConfigCommon->initialDownlinkBWP->genericParameters;
   int bwp_size = NRRIV2BW(genericParameters->locationAndBandwidth, MAX_BWP_SIZE);
   int bwp_start = NRRIV2PRBOFFSET(genericParameters->locationAndBandwidth, MAX_BWP_SIZE);
-  NR_ControlResourceSet_t *coreset = get_coreset_config(0, 0, 0, bwp_start, bwp_size, bitmap, configuration->do_TCI);
+  NR_ControlResourceSet_t *coreset = get_coreset_config(0,
+                                                        0,
+                                                        0,
+                                                        bwp_start,
+                                                        bwp_size,
+                                                        bitmap,
+                                                        configuration->do_TCI,
+                                                        configuration->coreset_duration);
   asn1cSeqAdd(&pdcch_Config->controlResourceSetToAddModList->list, coreset);
   // in case of MUX pattern 3, we should use commonControlResourceSet and not CSET0 for common SS
   NR_PDCCH_ConfigCommon_t *pdcch_common = scc->downlinkConfigCommon->initialDownlinkBWP->pdcch_ConfigCommon->choice.setup;

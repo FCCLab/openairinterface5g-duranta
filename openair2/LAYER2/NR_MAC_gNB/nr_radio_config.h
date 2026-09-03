@@ -57,7 +57,8 @@ int configure_coreset_for_mux23(const NR_ServingCellConfigCommon_t *scc,
                                 int limit,
                                 int bwp_start,
                                 int bwp_size,
-                                bool do_TCI);
+                                bool do_TCI,
+                                int coreset_duration);
 struct NR_MeasurementTimingConfiguration;
 struct NR_MeasurementTimingConfiguration *get_new_MeasurementTimingConfiguration(const NR_ServingCellConfigCommon_t *scc);
 int encode_MeasurementTimingConfiguration(const struct NR_MeasurementTimingConfiguration *mtc, uint8_t *buf, int buf_len);

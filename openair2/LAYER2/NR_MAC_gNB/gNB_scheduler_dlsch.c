@@ -699,6 +699,7 @@ bool commit_alloc(const nr_dl_sched_params_t *params, nr_dl_candidate_t *cand)
   return true;
 }
 
+/*! \brief Modular DL scheduler pipeline (collect → RI/PMI → beam → TDA → MCS → RB → dispatch). */
 static void nr_dl_schedule(gNB_MAC_INST *mac,
                            nr_cell_sched_t *cell,
                            post_process_pdsch_t *pp_pdsch,
@@ -712,7 +713,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
   NR_ServingCellConfigCommon_t *scc = cell->common_channels.ServingCellConfigCommon;
   int slots_per_frame = cell->frame_structure.numb_slots_frame;
 
-  /* Step 1: Collect candidates */
+  /* Step 1: Collect candidates (newTx + HARQ retx) */
   nr_dl_candidate_t candidates[MAX_MOBILES_PER_GNB] = {0};
   int n = collect_dl_candidates(cell, UE_list, candidates, MAX_MOBILES_PER_GNB, frame, slot);
   if (n == 0)
@@ -746,7 +747,6 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
 
   /* Step 6: Sort by beam, then call RB allocation policy per beam */
   qsort(candidates, n, sizeof(*candidates), compare_beam_idx);
-
   nr_dl_sched_params_t params = {
       .mac = mac,
       .cell = cell,
@@ -757,6 +757,8 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
       .min_mcs = cell->dl_bler.min_mcs,
       .bler_lower = cell->dl_bler.lower,
       .bler_upper = cell->dl_bler.upper,
+      .slice_rb_start = -1,
+      .slice_rb_end = -1,
   };
   for (int b = 0; b < num_beams; b++) {
     params.vrb_map[b] = cell->common_channels.vrb_map[b];
@@ -772,6 +774,30 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
     int count = i - start;
 
     mac->dl_rb_alloc(&params, candidates + start, count);
+  }
+
+  /* Under NS, abort HARQ only when the slice max can never hold this retx.
+   * A miss this slot (max_num_ue, CCE, moving slice window) must retry next TTI. */
+  if (mac->scheduler_type_dl == SCHE_NS) {
+    for (int j = 0; j < n; j++) {
+      nr_dl_candidate_t *cand = &candidates[j];
+      if (!cand->is_retx || cand->scheduled || cand->skipped)
+        continue;
+      if (!nr_ns_retx_exceeds_slice_max(mac->slice_scheduler_dl, cand->UE, cand->retx_rbSize))
+        continue;
+      NR_UE_sched_ctrl_t *sched_ctrl = &cand->UE->UE_sched_ctrl;
+      int harq_pid = cand->retx_harq_pid;
+      LOG_D(NR_MAC,
+            "[UE %04x][%4d.%2d] DL retransmission %d PRBs exceeds slice max (abort HARQ)\n",
+            cand->rnti,
+            frame,
+            slot,
+            cand->retx_rbSize);
+      reset_beam_status(&cell->beam_info, frame, slot, cand->alloc_beam_dir, slots_per_frame, cand->alloc_new_beam);
+      remove_nr_list(&sched_ctrl->retrans_dl_harq, harq_pid);
+      abort_nr_dl_harq(cand->UE, harq_pid);
+      cand->skipped = true;
+    }
   }
 
   /* Release beam reservations for candidates the policy rejected (failed
@@ -807,21 +833,22 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
     sched_pdsch.bwp_info = bwp_info;
 
     if (cand->is_retx) {
-      /* Retransmission: merge HARQ state (R, Qm, tb_size) with policy placement.
-       * DMRS must match the current TDA (recomputed by dl_tda_select when TDA
-       * changed; original otherwise). */
+      /* Retransmission: the UE recomputes TBS from the DCI grant. Keep the
+       * original time/freq size, MCS, layers and DMRS so TBS cannot drift
+       * from the buffered TB (NDI retx + TBS mismatch → treated as new data
+       * → RLC/SRB collapse). Only rbStart may move within the slice window. */
       NR_sched_pdsch_t harq_pdsch = sched_ctrl->harq_processes[cand->retx_harq_pid].sched_pdsch;
-      sched_pdsch.R = harq_pdsch.R;
-      sched_pdsch.Qm = harq_pdsch.Qm;
-      sched_pdsch.tb_size = harq_pdsch.tb_size;
+      const int rbStart = sched_pdsch.rbStart;
+      sched_pdsch = harq_pdsch;
+      sched_pdsch.rbStart = rbStart;
+      sched_pdsch.bwp_info = bwp_info;
+      sched_pdsch.pucch_allocation = cand->sched_pdsch.pucch_allocation;
       sched_pdsch.dl_harq_pid = cand->retx_harq_pid;
-      sched_pdsch.ant_port_idx = harq_pdsch.ant_port_idx;
-      bool tda_changed = sched_pdsch.tda_info.startSymbolIndex != harq_pdsch.tda_info.startSymbolIndex
-                         || sched_pdsch.tda_info.nrOfSymbols != harq_pdsch.tda_info.nrOfSymbols;
-      if (tda_changed)
-        sched_pdsch.dmrs_parms = get_dl_dmrs_params(scc, dl_bwp, &sched_pdsch.tda_info, sched_pdsch.nrOfLayers);
-      else
-        sched_pdsch.dmrs_parms = harq_pdsch.dmrs_parms;
+      AssertFatal(sched_pdsch.rbSize == cand->retx_rbSize,
+                  "[UE %04x] retx placed with rbSize %d but HARQ has %d\n",
+                  cand->rnti,
+                  cand->retx_rbSize,
+                  sched_pdsch.rbSize);
     } else {
       /* New transmission: compute TBS-related fields */
       int l = sched_pdsch.nrOfLayers;
@@ -859,7 +886,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
       const uint16_t num_log_ports = p->XP * p->N1 * p->N2;
       sched_pdsch.ant_port_idx.numSpatialStreamIndices = num_log_ports;
       const int start_stream_idx = cand->alloc_beam_idx * num_log_ports;
-      for (int i = 0; i < sched_pdsch.ant_port_idx.numSpatialStreamIndices;i++)
+      for (int i = 0; i < sched_pdsch.ant_port_idx.numSpatialStreamIndices; i++)
         sched_pdsch.ant_port_idx.spatialStreamIndices[i] = cell->radio_config.spatial_stream_index[start_stream_idx + i];
     }
 
@@ -881,9 +908,9 @@ void nr_dlsch_preprocessor(gNB_MAC_INST *mac, nr_cell_sched_t *cell, post_proces
   for (int i = 0; i < num_beams; i++)
     n_rb_sched[i] = bw;
 
-  // FAPI cannot handle more than MAX_DCI_CORESET DCIs
-  static_assert(4 < MAX_DCI_CORESET, "cannot have more concurrent UEs than MAX_DCI_CORESET\n");
-  int max_sched_ues = 4;
+  /* Soft budget per direction; MAX_DCI_CORESET is FAPI array size only. */
+  static_assert(MAX_DCI_CORESET >= 1, "MAX_DCI_CORESET must be positive");
+  int max_sched_ues = nr_mac_soft_dci_budget_per_dir(cell);
 
   nr_dl_schedule(mac, cell, pp_pdsch, UE_info->connected_ue_list, max_sched_ues, num_beams, n_rb_sched);
 }

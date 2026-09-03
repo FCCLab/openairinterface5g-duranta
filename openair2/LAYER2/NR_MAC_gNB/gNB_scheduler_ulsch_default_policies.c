@@ -8,6 +8,10 @@
  * These are the built-in defaults behind the UL scheduler function pointers.
  * Extracted from gNB_scheduler_ulsch.c to allow clean replacement by custom
  * scheduler plugins.
+ *
+ * nr_ul_proportional_fair honours nr_ul_sched_params_t::slice_rb_start/end when
+ * SCHE_NS schedules per slice via nr_ul_schedule_ns() → filter_ul_candidates_for_slice()
+ * → nr_ul_schedule_candidates() → nr_slice_rb_bounds() → get_rb_alloc_slice().
  */
 
 #include "gNB_scheduler_ulsch_default_policies.h"
@@ -228,6 +232,38 @@ static int compare_ul_pf_rb_ptrs(const void *a, const void *b)
   return (wa < wb) - (wa > wb);
 }
 
+/* RB allocation helper used by nr_ul_proportional_fair (same slice/BWP model as DL). */
+static bool nr_ul_get_rb_alloc(const nr_ul_sched_params_t *params,
+                               const nr_ul_candidate_t *cand,
+                               int rbSize_min,
+                               int rbSize_max,
+                               const uint16_t *vrb_map,
+                               int *rbStart,
+                               int *rbSize)
+{
+  int slice_start, slice_end;
+  nr_slice_rb_bounds(params->slice_rb_start,
+                     params->slice_rb_end,
+                     cand->bwp_start,
+                     cand->bwp_size,
+                     &slice_start,
+                     &slice_end);
+  if (slice_start >= slice_end && cand->bwp_size > 0) {
+    slice_start = 0;
+    slice_end = cand->bwp_size;
+  }
+  return get_rb_alloc_slice(rbSize_min,
+                            rbSize_max,
+                            cand->bwp_start,
+                            cand->bwp_size,
+                            vrb_map,
+                            cand->alloc_slbitmap,
+                            slice_start,
+                            slice_end,
+                            rbStart,
+                            rbSize);
+}
+
 static void nr_ul_port_select_default(const nr_ul_sched_params_t *params, nr_ul_candidate_t *cand)
 {
   if (cand->is_retx) {
@@ -272,10 +308,9 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
 
     nr_ul_port_select_default(params, cand);
 
-    int rbStart;
+    int rbStart, rbSize;
     uint16_t *vrb_map = params->vrb_map_UL[cand->alloc_beam_idx];
-    int block_len = find_largest_free_block(vrb_map, cand->alloc_slbitmap, cand->bwp_start, cand->bwp_size, &rbStart);
-    if (block_len < cand->retx_rbSize)
+    if (!nr_ul_get_rb_alloc(params, cand, cand->retx_rbSize, cand->retx_rbSize, vrb_map, &rbStart, &rbSize))
       continue;
 
     COMMIT_UL_ALLOC(params, cand, rbStart, cand->retx_rbSize, cand->sched_pusch.mcs, n_scheduled);
@@ -290,9 +325,8 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
     nr_ul_port_select_default(params, cand);
 
     uint16_t *vrb_map = params->vrb_map_UL[cand->alloc_beam_idx];
-    int rbStart;
-    int block_len = find_largest_free_block(vrb_map, cand->alloc_slbitmap, cand->bwp_start, cand->bwp_size, &rbStart);
-    if (block_len < min_rb)
+    int rbStart, rbSize;
+    if (!nr_ul_get_rb_alloc(params, cand, min_rb, min_rb, vrb_map, &rbStart, &rbSize))
       continue;
 
     COMMIT_UL_ALLOC(params, cand, rbStart, min_rb, cand->sched_pusch.mcs, n_scheduled);
@@ -300,8 +334,25 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
 
   /* BW is the same across all beams, just use beam 0 */
   int max_rbSize = params->n_rb_avail[0];
-  DevAssert(max_rbSize >= min_rb);
   int n_remain_ue = params->max_num_ue - n_scheduled;
+  if (n_remain_ue <= 0)
+    return n_scheduled;
+  /* NS can assign fewer PRBs than type-1 min; skip new-data PF rather than assert. */
+  if (max_rbSize < min_rb) {
+    static frame_t last_warn_frame = -1;
+    if (max_rbSize > 0 && params->dci_frame != last_warn_frame) {
+      last_warn_frame = params->dci_frame;
+      LOG_W(NR_MAC,
+            "%4d.%2d UL PF: slice [%d,%d) has %d PRBs < min %d, skip new-data\n",
+            params->dci_frame,
+            params->dci_slot,
+            params->slice_rb_start,
+            params->slice_rb_end,
+            max_rbSize,
+            min_rb);
+    }
+    return n_scheduled;
+  }
   // share RBs fairly between remaining allocatable UEs
   int n_rb_per_ue = max(min_rb, max_rbSize / n_remain_ue);
 
@@ -381,10 +432,167 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
     }
     int rbStart, rbSize;
     uint16_t *vrb_map = params->vrb_map_UL[cand->alloc_beam_idx];
-    if (!get_rb_alloc(min_rb, rb_req, cand->bwp_start, cand->bwp_size, vrb_map, cand->alloc_slbitmap, &rbStart, &rbSize))
+    if (!nr_ul_get_rb_alloc(params, cand, min_rb, rb_req, vrb_map, &rbStart, &rbSize))
       continue;
     COMMIT_UL_ALLOC(params, cand, rbStart, rbSize, mcs, n_scheduled);
   }
 
   return n_scheduled;
+}
+
+static int ul_ns_candidate_required_prbs(const nr_cell_sched_t *cell,
+                                         const nr_ul_candidate_t *cand)
+{
+  if (!cand)
+    return 0;
+
+  if (cand->is_retx)
+    return max(cand->retx_rbSize, (int)cell->min_grant_prb);
+
+  const int bytes_per_prb_estimate = 2;
+  int required_prbs = cand->pending_bytes > 0 ? (cand->pending_bytes + bytes_per_prb_estimate - 1) / bytes_per_prb_estimate : 0;
+
+  if (required_prbs > 0 || cand->sched_inactive)
+    required_prbs = max(required_prbs, max((int)cell->min_grant_prb, MIN_RB_SIZE));
+
+  return required_prbs;
+}
+
+int nr_ul_slice_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_t *candidates, int n_candidates)
+{
+  if (n_candidates == 0)
+    return 0;
+
+  gNB_MAC_INST *mac = params->mac;
+  slice_scheduler_t *slice_scheduler = mac ? mac->slice_scheduler_ul : NULL;
+  if (slice_scheduler == NULL || slice_sch_get_num_slices(slice_scheduler) == 0) {
+    return nr_ul_proportional_fair(params, candidates, n_candidates);
+  }
+
+  const nr_cell_sched_t *cell = params->cell;
+  frame_t frame = params->frame;
+  slot_t slot = params->slot;
+  int total_prbs = params->n_rb_avail[0];
+  if (total_prbs <= 0 && cell) {
+    const NR_ServingCellConfigCommon_t *scc = cell->common_channels.ServingCellConfigCommon;
+    if (scc && scc->uplinkConfigCommon && scc->uplinkConfigCommon->frequencyInfoUL &&
+        scc->uplinkConfigCommon->frequencyInfoUL->scs_SpecificCarrierList.list.count > 0) {
+      total_prbs = scc->uplinkConfigCommon->frequencyInfoUL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth;
+    }
+  }
+
+  if (total_prbs > 0)
+    slice_sch_update_total_prbs(slice_scheduler, total_prbs);
+
+  int num_slices = slice_sch_get_num_slices(slice_scheduler);
+  for (int s = 0; s < num_slices; s++) {
+    const slice_nssai_t *slice_nssai = slice_sch_get_slice_nssai(slice_scheduler, s);
+    if (slice_nssai == NULL)
+      continue;
+
+    int required_prbs = 0;
+    FOR_EACH_CANDIDATE(cand, candidates, n_candidates) {
+      if (cand->skipped || !cand->UE)
+        continue;
+      NR_UE_sched_ctrl_t *sched_ctrl = &cand->UE->UE_sched_ctrl;
+      nssai_t ue_slice = {0};
+      nr_mac_get_ue_effective_nssai(sched_ctrl, &ue_slice);
+      if (ue_slice.sst != slice_nssai->sst || ue_slice.sd != slice_nssai->sd)
+        continue;
+
+      int ue_required = ul_ns_candidate_required_prbs(cell, cand);
+      required_prbs += ue_required;
+    }
+    required_prbs = min(required_prbs, total_prbs);
+    slice_sch_update_require(slice_scheduler, slice_nssai->sst, slice_nssai->sd, required_prbs);
+  }
+
+  slice_sch_schedule(slice_scheduler);
+
+  int num_ranges = 0;
+  const slice_prb_range_t *allocation = slice_sch_get_allocation(slice_scheduler, &num_ranges);
+  if (allocation == NULL || num_ranges == 0)
+    return 0;
+
+  const int slots_per_frame = cell->frame_structure.numb_slots_frame;
+  const int start = (frame * slots_per_frame + slot) % num_ranges;
+
+  int total_scheduled = 0;
+  int remaining_ues = params->max_num_ue;
+
+  /* Same as DL NS: fixed-size UL HARQ retx must not be trapped in a moving /
+   * shrinking slice window. Place retx on the full UL BWP first. */
+  {
+    nr_ul_candidate_t retx_cands[MAX_MOBILES_PER_GNB];
+    int retx_idx[MAX_MOBILES_PER_GNB];
+    int n_retx = 0;
+    for (int j = 0; j < n_candidates; j++) {
+      if (candidates[j].skipped || candidates[j].scheduled || !candidates[j].is_retx)
+        continue;
+      retx_idx[n_retx] = j;
+      retx_cands[n_retx] = candidates[j];
+      n_retx++;
+    }
+    if (n_retx > 0 && remaining_ues > 0) {
+      nr_ul_sched_params_t retx_params = *params;
+      retx_params.max_num_ue = remaining_ues;
+      retx_params.slice_rb_start = -1;
+      retx_params.slice_rb_end = -1;
+      const int full_bw = total_prbs > 0 ? total_prbs : params->n_rb_avail[0];
+      for (int b = 0; b < params->num_beams; b++)
+        retx_params.n_rb_avail[b] = full_bw;
+
+      int n_sched = nr_ul_proportional_fair(&retx_params, retx_cands, n_retx);
+      for (int k = 0; k < n_retx; k++)
+        candidates[retx_idx[k]] = retx_cands[k];
+      total_scheduled += n_sched;
+      remaining_ues -= n_sched;
+    }
+  }
+
+  for (int i = 0; i < num_ranges; i++) {
+    if (remaining_ues <= 0)
+      break;
+    const int s = (start + i) % num_ranges;
+    if (allocation[s].num_prbs <= 0)
+      continue;
+
+    nr_ul_candidate_t slice_candidates[MAX_MOBILES_PER_GNB];
+    int slice_cand_count = 0;
+    int slice_cand_indices[MAX_MOBILES_PER_GNB];
+
+    for (int j = 0; j < n_candidates; j++) {
+      if (candidates[j].skipped || candidates[j].scheduled)
+        continue;
+      nssai_t ue_slice = {0};
+      nr_mac_get_ue_effective_nssai(&candidates[j].UE->UE_sched_ctrl, &ue_slice);
+      if (ue_slice.sst == allocation[s].slice_id.sst && ue_slice.sd == allocation[s].slice_id.sd) {
+        slice_cand_indices[slice_cand_count] = j;
+        slice_candidates[slice_cand_count] = candidates[j];
+        slice_cand_count++;
+      }
+    }
+
+    if (slice_cand_count == 0)
+      continue;
+
+    nr_ul_sched_params_t slice_params = *params;
+    slice_params.max_num_ue = remaining_ues;
+    slice_params.slice_rb_start = allocation[s].start_prb;
+    slice_params.slice_rb_end = allocation[s].end_prb;
+    for (int b = 0; b < params->num_beams; b++)
+      slice_params.n_rb_avail[b] = allocation[s].num_prbs;
+
+    int n_sched = nr_ul_proportional_fair(&slice_params, slice_candidates, slice_cand_count);
+
+    for (int k = 0; k < slice_cand_count; k++) {
+      int orig_idx = slice_cand_indices[k];
+      candidates[orig_idx] = slice_candidates[k];
+    }
+
+    total_scheduled += n_sched;
+    remaining_ues -= n_sched;
+  }
+
+  return total_scheduled;
 }
