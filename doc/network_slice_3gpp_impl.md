@@ -296,7 +296,6 @@ Slice policy can be read and updated over E2:
 |-----------|------|
 | RAN function | `openair2/E2AP/RAN_FUNCTION/CUSTOMIZED/ran_func_slice.c` |
 | Policy source | `slice_scheduler_dl` / `slice_scheduler_ul` when `SCHE_NS` active |
-| xApp (NWS) | `nws/scripts/xapp/` — REST on port 18080, Slice SM indications |
 
 E2 SET updates dedicated/min/max ratios at runtime; gNB logs `NS E2 SET applied`
 on success.
@@ -371,4 +370,5 @@ unchanged; only the per-slice UE scheduler path uses `nr_*_schedule()` now.
 - [MAC/scheduler-architecture.md](MAC/scheduler-architecture.md) — modular PF pipeline
 - [slice_prb_allocator/README.md](../openair2/LAYER2/NR_MAC_gNB/slice_prb_allocator/README.md) — allocation algorithm
 - [nws/scripts/readme.md](../../nws/scripts/readme.md) — lab bring-up and `--sch` modes
-- [nws/scripts/xapp/readme.md](../../nws/scripts/xapp/readme.md) — REST / E2 control
+- [nws/app_xapp/README.md](../../nws/app_xapp/README.md) — xApp REST / E2 control + console
+- [nws/app_rapp/README.md](../../nws/app_rapp/README.md) — Non-RT rApp intents / profiles
