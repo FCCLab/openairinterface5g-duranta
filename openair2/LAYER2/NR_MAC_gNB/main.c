@@ -291,10 +291,21 @@ size_t dump_mac_stats(gNB_MAC_INST *gNB, const nr_cell_sched_t *cell, char *outp
         sched_ctrl->ul_cce_fail);
 
     // normally a UE should have at least one LCID, 1 in SA or 4 in NSA/phy-test
-    output = st_append(output, end, "UE %04x: LCID ", UE->rnti);
+    output = st_append(output,
+                       end,
+                       "UE %04x: current slice SST 0x%02x SD 0x%06x\n",
+                       UE->rnti,
+                       ue_slice.sst,
+                       (unsigned)ue_slice.sd);
+    output = st_append(output, end, "UE %04x: LCID", UE->rnti);
     for (int i = 0; i < seq_arr_size(&sched_ctrl->lc_config); i++) {
       const nr_lc_config_t *c = seq_arr_at(&sched_ctrl->lc_config, i);
-      output = st_append(output, end, "%d,", c->lcid);
+      output = st_append(output,
+                         end,
+                         " %d SST 0x%02x SD 0x%06x,",
+                         c->lcid,
+                         c->nssai.sst,
+                         (unsigned)c->nssai.sd);
     }
     float dl_thr = UE->dl_thr_ue_display / 1e6;
     float ul_thr = UE->ul_thr_ue_display / 1e6;
