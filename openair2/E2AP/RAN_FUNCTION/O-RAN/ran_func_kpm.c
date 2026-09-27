@@ -442,6 +442,8 @@ static const char* kpm_node_meas_du[] = {
   "CARR.PDSCHMCSDist",
   "CARR.PUSCHMCSDist",
   "L1M.SS-RSRP",
+  "DRB.UEThpDl",
+  "DRB.UEThpUl",
   NULL,
 };
 
@@ -457,6 +459,10 @@ static const char* kpm_node_meas_gnb[] = {
   "L1M.SS-RSRP",
   "MR.NRScSSSINR",
   "RRC.ConnMean",
+  "DRB.PdcpSduVolumeDL",
+  "DRB.PdcpSduVolumeUL",
+  "DRB.UEThpDl",
+  "DRB.UEThpUl",
   NULL,
 };
 

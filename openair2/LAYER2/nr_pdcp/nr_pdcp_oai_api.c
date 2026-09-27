@@ -1005,6 +1005,31 @@ bool nr_pdcp_get_statistics(ue_id_t ue_id, int srb_flag, int rb_id, nr_pdcp_stat
   return ret;
 }
 
+bool nr_pdcp_consume_sdu_activity(ue_id_t ue_id, int srb_flag, int rb_id, bool downlink,
+                                  uint32_t *bytes, uint64_t *active_ms)
+{
+  nr_pdcp_ue_t *ue;
+  nr_pdcp_entity_t *rb;
+  bool ret = false;
+
+  nr_pdcp_manager_lock(nr_pdcp_ue_manager);
+  ue = nr_pdcp_manager_get_ue(nr_pdcp_ue_manager, ue_id);
+  rb = nr_pdcp_get_rb(ue, rb_id, srb_flag);
+
+  if (rb != NULL) {
+    uint64_t *first = downlink ? &rb->stats.dl_sdu_first_ms : &rb->stats.ul_sdu_first_ms;
+    uint64_t *last = downlink ? &rb->stats.dl_sdu_last_ms : &rb->stats.ul_sdu_last_ms;
+    *bytes = downlink ? rb->stats.rxsdu_bytes : rb->stats.txsdu_bytes;
+    *active_ms = (*first == 0) ? 0 : (*last - *first);
+    *first = 0;
+    *last = 0;
+    ret = true;
+  }
+
+  nr_pdcp_manager_unlock(nr_pdcp_ue_manager);
+  return ret;
+}
+
 int nr_pdcp_get_num_ues(ue_id_t *ue_list, int len)
 {
   nr_pdcp_manager_lock(nr_pdcp_ue_manager);

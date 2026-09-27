@@ -72,6 +72,14 @@ typedef struct {
   uint32_t rxsdu_pkts;     /* number of SDUs received */
   uint32_t rxsdu_bytes;    /* number of bytes of SDUs received */
 
+  /* Active-time window for DRB.UEThp*, CLOCK_MONOTONIC ms.
+     0 means no SDU since the last nr_pdcp_consume_sdu_activity().
+     DL follows rxsdu (SDU accepted from the core). UL follows txsdu (SDU delivered up). */
+  uint64_t dl_sdu_first_ms;
+  uint64_t dl_sdu_last_ms;
+  uint64_t ul_sdu_first_ms;
+  uint64_t ul_sdu_last_ms;
+
   uint8_t  mode;               /* 0: PDCP AM, 1: PDCP UM, 2: PDCP TM */
 } nr_pdcp_statistics_t;
 

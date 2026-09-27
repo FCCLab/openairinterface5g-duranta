@@ -7,6 +7,7 @@
 
 #include <search.h>
 
+#include "common/ran_context.h"
 #include "openair2/RRC/NR/rrc_gNB_UE_context.h"
 
 e2_node_level_stats_t cp_node_level_stats(const e2_node_level_stats_t *src)
@@ -30,64 +31,124 @@ typedef struct uldlcounter {
   uint32_t ul;
 } uldlcounter_t;
 
+/* Indexed by rrc_ue_id - 1 (RRC allocates rrc_ue_id = uid + 1). */
 static uldlcounter_t last_pdcp_sdu_total_bytes[MAX_MOBILES_PER_GNB] = {0};
 
-static nr_pdcp_statistics_t get_pdcp_stats_per_drb(const uint32_t rrc_ue_id, const int rb_id)
+static const int kpm_pdcp_drb_id = 1; /* only 1 DRB is supported */
+
+static uldlcounter_t *pdcp_last_for_ue(uint32_t rrc_ue_id)
 {
+  if (rrc_ue_id == 0 || rrc_ue_id > MAX_MOBILES_PER_GNB)
+    return NULL;
+  return &last_pdcp_sdu_total_bytes[rrc_ue_id - 1];
+}
+
+/* Style 1 passes a zeroed ue_info. Style 4 always fills rrc_ue_id (and ue on mono/DU). */
+static bool pdcp_volume_is_node_level(cudu_ue_info_pair_t ue_info)
+{
+  return ue_info.ue == NULL && ue_info.rrc_ue_id == 0;
+}
+
+static bool ue_pdu_matches_slice(const gNB_RRC_UE_t *ue, const s_nssai_e2sm_t *slice)
+{
+  FOR_EACH_SEQ_ARR(rrc_pdu_session_param_t *, item, &ue->pduSessions) {
+    const nssai_t *nssai = &item->param.nssai;
+    if (nssai->sst != slice->sST)
+      continue;
+    if (slice->sD == NULL)
+      return nssai->sd == 0xffffff;
+    if ((nssai->sd & 0xffffff) == (*slice->sD & 0xffffff))
+      return true;
+  }
+  return false;
+}
+
+/* Mb delivered since the previous report for this UE. Updates *last. */
+static int64_t pdcp_sdu_volume_delta_mb(uint32_t now_bytes, uint32_t *last)
+{
+  const uint32_t prev = *last;
+  *last = now_bytes;
+  return (int64_t)(now_bytes - prev) * 8 / 1000000;
+}
+
+/* Sum PDCP SDU volume over RRC UEs. slice == NULL means every UE. */
+static int64_t sum_pdcp_sdu_volume_mb(bool downlink, const s_nssai_e2sm_t *slice)
+{
+  int64_t sum = 0;
+  if (RC.nrrrc == NULL || RC.nrrrc[0] == NULL)
+    return 0;
+
+  struct rrc_gNB_ue_context_s *rrc_ue_context = NULL;
+  RB_FOREACH(rrc_ue_context, rrc_nr_ue_tree_s, &RC.nrrrc[0]->rrc_ue_head) {
+    gNB_RRC_UE_t *ue = &rrc_ue_context->ue_context;
+    if (slice != NULL && !ue_pdu_matches_slice(ue, slice))
+      continue;
+
+    uldlcounter_t *last = pdcp_last_for_ue(ue->rrc_ue_id);
+    if (last == NULL)
+      continue;
+
+    nr_pdcp_statistics_t pdcp = {0};
+    if (!nr_pdcp_get_statistics(ue->rrc_ue_id, 0, kpm_pdcp_drb_id, &pdcp))
+      continue;
+
+    if (downlink)
+      sum += pdcp_sdu_volume_delta_mb(pdcp.rxsdu_bytes, &last->dl);
+    else
+      sum += pdcp_sdu_volume_delta_mb(pdcp.txsdu_bytes, &last->ul);
+  }
+  return sum;
+}
+
+static meas_record_lst_t fill_pdcp_sdu_volume_ue(bool downlink, cudu_ue_info_pair_t ue_info)
+{
+  meas_record_lst_t meas_record = {0};
+  uldlcounter_t *last = pdcp_last_for_ue(ue_info.rrc_ue_id);
   nr_pdcp_statistics_t pdcp = {0};
-  const int srb_flag = 0;
-
-  // Get PDCP stats for specific DRB
-  const bool rc = nr_pdcp_get_statistics(rrc_ue_id, srb_flag, rb_id, &pdcp);
+  const bool rc = nr_pdcp_get_statistics(ue_info.rrc_ue_id, 0, kpm_pdcp_drb_id, &pdcp);
   assert(rc == true && "Cannot get PDCP stats\n");
+  assert(last != NULL && "rrc_ue_id out of PDCP volume counter range");
 
-  return pdcp;
+  meas_record.value = INTEGER_MEAS_VALUE;
+  if (downlink)
+    meas_record.int_val = pdcp_sdu_volume_delta_mb(pdcp.rxsdu_bytes, &last->dl);
+  else
+    meas_record.int_val = pdcp_sdu_volume_delta_mb(pdcp.txsdu_bytes, &last->ul);
+  return meas_record;
 }
 
 /* 3GPP TS 28.522 - section 5.1.2.1.1.1
-  note: this measurement is calculated as per spec */
-static meas_record_lst_t fill_DRB_PdcpSduVolumeDL(__attribute__((unused)) const label_info_lst_t label,
+   Style 4: per UE. Style 1: node sum, optionally filtered by label.sliceID. */
+static meas_record_lst_t fill_DRB_PdcpSduVolumeDL(const label_info_lst_t label,
                                                   __attribute__((unused)) uint32_t gran_period_ms,
                                                   cudu_ue_info_pair_t ue_info,
-                                                  const size_t ue_idx,
-                                                  __attribute__((unused))e2_node_level_stats_t* node_stats)
+                                                  __attribute__((unused)) const size_t ue_idx,
+                                                  __attribute__((unused)) e2_node_level_stats_t *node_stats)
 {
-  meas_record_lst_t meas_record = {0};
-
-  // Get PDCP stats per DRB
-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
-  nr_pdcp_statistics_t pdcp = get_pdcp_stats_per_drb(ue_info.rrc_ue_id, rb_id);
-
-  meas_record.value = INTEGER_MEAS_VALUE;
-
-  // Get DL data volume delivered to PDCP layer
-  meas_record.int_val = (pdcp.rxsdu_bytes - last_pdcp_sdu_total_bytes[ue_idx].dl)*8/1000000;   // [Mb]
-  last_pdcp_sdu_total_bytes[ue_idx].dl = pdcp.rxsdu_bytes;
-
-  return meas_record;
+  if (pdcp_volume_is_node_level(ue_info)) {
+    meas_record_lst_t meas_record = {0};
+    meas_record.value = INTEGER_MEAS_VALUE;
+    meas_record.int_val = sum_pdcp_sdu_volume_mb(true, label.sliceID);
+    return meas_record;
+  }
+  return fill_pdcp_sdu_volume_ue(true, ue_info);
 }
 
 /* 3GPP TS 28.522 - section 5.1.2.1.2.1
-  note: this measurement is calculated as per spec */
-static meas_record_lst_t fill_DRB_PdcpSduVolumeUL(__attribute__((unused)) const label_info_lst_t label,
+   Style 4: per UE. Style 1: node sum, optionally filtered by label.sliceID. */
+static meas_record_lst_t fill_DRB_PdcpSduVolumeUL(const label_info_lst_t label,
                                                   __attribute__((unused)) uint32_t gran_period_ms,
                                                   cudu_ue_info_pair_t ue_info,
-                                                  const size_t ue_idx,
-                                                  __attribute__((unused))e2_node_level_stats_t* node_stats)
+                                                  __attribute__((unused)) const size_t ue_idx,
+                                                  __attribute__((unused)) e2_node_level_stats_t *node_stats)
 {
-  meas_record_lst_t meas_record = {0};
-
-  // Get PDCP stats per DRB
-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
-  nr_pdcp_statistics_t pdcp = get_pdcp_stats_per_drb(ue_info.rrc_ue_id, rb_id);
-
-  meas_record.value = INTEGER_MEAS_VALUE;
-
-  // Get UL data volume delivered from PDCP layer
-  meas_record.int_val = (pdcp.txsdu_bytes - last_pdcp_sdu_total_bytes[ue_idx].ul)*8/1000000;   // [Mb]
-  last_pdcp_sdu_total_bytes[ue_idx].ul = pdcp.txsdu_bytes;
-
-  return meas_record;
+  if (pdcp_volume_is_node_level(ue_info)) {
+    meas_record_lst_t meas_record = {0};
+    meas_record.value = INTEGER_MEAS_VALUE;
+    meas_record.int_val = sum_pdcp_sdu_volume_mb(false, label.sliceID);
+    return meas_record;
+  }
+  return fill_pdcp_sdu_volume_ue(false, ue_info);
 }
 
 /* L1M.SS-RSRP — 3GPP TS 28.552 - section 5.1.1.22.1 */
@@ -193,8 +254,71 @@ static meas_record_lst_t fill_RRC_ConnMean(__attribute__((unused)) const label_i
 }
 
 #if defined (NGRAN_GNB_DU)
-static uldlcounter_t last_rlc_pdu_total_bytes[MAX_MOBILES_PER_GNB] = {0};
 static uldlcounter_t last_total_prbs[MAX_MOBILES_PER_GNB] = {0};
+
+/* Own baseline so a DRB.PdcpSduVolume subscription does not steal this delta.
+   Active time is consumed only by these fillers. */
+static uldlcounter_t last_pdcp_thp_bytes[MAX_MOBILES_PER_GNB] = {0};
+
+/* One UE's PDCP SDU byte delta and active time since the previous sample.
+   A nonzero delta with a zero span (one SDU, or several in the same ms) uses a 1 ms floor. */
+static bool pdcp_thp_sample(uint32_t rrc_ue_id, bool downlink, uint32_t *delta_bytes, uint64_t *active_ms)
+{
+  if (rrc_ue_id == 0 || rrc_ue_id > MAX_MOBILES_PER_GNB)
+    return false;
+
+  uint32_t *last = downlink ? &last_pdcp_thp_bytes[rrc_ue_id - 1].dl
+                            : &last_pdcp_thp_bytes[rrc_ue_id - 1].ul;
+  uint32_t bytes = 0;
+  uint64_t active = 0;
+  if (!nr_pdcp_consume_sdu_activity(rrc_ue_id, 0, kpm_pdcp_drb_id, downlink, &bytes, &active))
+    return false;
+
+  const uint32_t prev = *last;
+  *last = bytes;
+  const uint32_t delta = bytes - prev;
+  /* No new SDUs: ignore a leftover span. One SDU in a single millisecond has span 0. */
+  if (delta == 0)
+    active = 0;
+  else if (active == 0)
+    active = 1;
+  *delta_bytes = delta;
+  *active_ms = active;
+  return true;
+}
+
+/* kbps. sum of PDCP SDU bytes over the UEs, divided by the longest active time. */
+static double active_thp_kbps(uint64_t sum_bytes, uint64_t max_active_ms)
+{
+  if (sum_bytes == 0 || max_active_ms == 0)
+    return 0.0;
+  return (double)sum_bytes * 8.0 / (double)max_active_ms;
+}
+
+/* slice == NULL means every RRC UE. */
+static double slice_active_thp_kbps(bool downlink, const s_nssai_e2sm_t *slice)
+{
+  if (RC.nrrrc == NULL || RC.nrrrc[0] == NULL)
+    return 0.0;
+
+  uint64_t sum_bytes = 0;
+  uint64_t max_active = 0;
+  struct rrc_gNB_ue_context_s *rrc_ue_context = NULL;
+  RB_FOREACH(rrc_ue_context, rrc_nr_ue_tree_s, &RC.nrrrc[0]->rrc_ue_head) {
+    gNB_RRC_UE_t *ue = &rrc_ue_context->ue_context;
+    if (slice != NULL && !ue_pdu_matches_slice(ue, slice))
+      continue;
+
+    uint32_t delta = 0;
+    uint64_t active = 0;
+    if (!pdcp_thp_sample(ue->rrc_ue_id, downlink, &delta, &active))
+      continue;
+    sum_bytes += delta;
+    if (active > max_active)
+      max_active = active;
+  }
+  return active_thp_kbps(sum_bytes, max_active);
+}
 
 static nr_rlc_statistics_t get_rlc_stats_per_drb(const rnti_t rnti, const int rb_id)
 {
@@ -233,50 +357,46 @@ static meas_record_lst_t fill_DRB_RlcSduDelayDl(__attribute__((unused)) const la
   return meas_record;
 }
 
-/* 3GPP TS 28.522 - section 5.1.1.3.1
-  note: per spec, average UE throughput in DL (taken into consideration values from all UEs, and averaged)
-        here calculated as: UE specific throughput in DL */
-static meas_record_lst_t fill_DRB_UEThpDl(__attribute__((unused)) const label_info_lst_t label,
-                                          uint32_t gran_period_ms,
-                                          cudu_ue_info_pair_t ue_info,
-                                          const size_t ue_idx,
-                                          __attribute__((unused))e2_node_level_stats_t* node_stats)
+/* 3GPP TS 28.552 - section 5.1.1.3.1 / 5.1.1.3.3
+   kbps = PDCP SDU bytes * 8 / active time.
+   Style 4: that UE. Style 1: sum of slice UEs' bytes / max of their active times.
+   granularityPeriod is not the denominator. */
+static meas_record_lst_t fill_drb_ue_thp(bool downlink, const label_info_lst_t label, cudu_ue_info_pair_t ue_info)
 {
   meas_record_lst_t meas_record = {0};
-  
-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
-  nr_rlc_statistics_t rlc = get_rlc_stats_per_drb(ue_info.ue->rnti, rb_id);
   meas_record.value = REAL_MEAS_VALUE;
 
-  // Calculate DL Thp
-  meas_record.real_val = (double)(rlc.txpdu_bytes - last_rlc_pdu_total_bytes[ue_idx].dl)*8/gran_period_ms;  // [kbps]
-  last_rlc_pdu_total_bytes[ue_idx].dl = rlc.txpdu_bytes;
+  if (pdcp_volume_is_node_level(ue_info)) {
+    meas_record.real_val = slice_active_thp_kbps(downlink, label.sliceID);
+    return meas_record;
+  }
 
+  uint32_t delta = 0;
+  uint64_t active = 0;
+  if (!pdcp_thp_sample(ue_info.rrc_ue_id, downlink, &delta, &active)) {
+    meas_record.real_val = 0.0;
+    return meas_record;
+  }
+  meas_record.real_val = active_thp_kbps(delta, active);
   return meas_record;
 }
 
-/* 3GPP TS 28.522 - section 5.1.1.3.3
-  note: per spec, average UE throughput in UL (taken into consideration values from all UEs, and averaged)
-        here calculated as: UE specific throughput in UL */
-static meas_record_lst_t fill_DRB_UEThpUl(__attribute__((unused)) const label_info_lst_t label,
-                                          uint32_t gran_period_ms,
+static meas_record_lst_t fill_DRB_UEThpDl(const label_info_lst_t label,
+                                          __attribute__((unused)) uint32_t gran_period_ms,
                                           cudu_ue_info_pair_t ue_info,
-                                          const size_t ue_idx,
-                                          __attribute__((unused))e2_node_level_stats_t* node_stats)
+                                          __attribute__((unused)) const size_t ue_idx,
+                                          __attribute__((unused)) e2_node_level_stats_t *node_stats)
 {
-  meas_record_lst_t meas_record = {0};
-  
-  // Get RLC stats per DRB
-  const int rb_id = 1;  // at the moment, only 1 DRB is supported
-  nr_rlc_statistics_t rlc = get_rlc_stats_per_drb(ue_info.ue->rnti, rb_id);
+  return fill_drb_ue_thp(true, label, ue_info);
+}
 
-  meas_record.value = REAL_MEAS_VALUE;
-
-  // Calculate UL Thp
-  meas_record.real_val = (double)(rlc.rxpdu_bytes - last_rlc_pdu_total_bytes[ue_idx].ul)*8/gran_period_ms;  // [kbps]
-  last_rlc_pdu_total_bytes[ue_idx].ul = rlc.rxpdu_bytes;
-  
-  return meas_record;
+static meas_record_lst_t fill_DRB_UEThpUl(const label_info_lst_t label,
+                                          __attribute__((unused)) uint32_t gran_period_ms,
+                                          cudu_ue_info_pair_t ue_info,
+                                          __attribute__((unused)) const size_t ue_idx,
+                                          __attribute__((unused)) e2_node_level_stats_t *node_stats)
+{
+  return fill_drb_ue_thp(false, label, ue_info);
 }
 
 /* 3GPP TS 28.522 - section 5.1.1.2.1

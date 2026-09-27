@@ -66,3 +66,26 @@ add_executable(ran_func_rc_test
 target_link_libraries(ran_func_rc_test PRIVATE ran_func_rc_helper m)
 add_dependencies(tests ran_func_rc_test)
 add_test(NAME ran_func_rc_test COMMAND ran_func_rc_test)
+
+# Drives get_kpm_meas_value() for per-slice PDCP volume and UE throughput.
+# PDCP/RLC/F1 are stubbed in the test; RRC tree walk and MAC UE list are real.
+add_executable(ran_func_kpm_slice_test
+  ran_func_kpm_slice_test.c
+  ../ran_func_kpm_subs.c
+)
+target_include_directories(ran_func_kpm_slice_test PRIVATE
+  ${CMAKE_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_SOURCE_DIR}/openair2/LAYER2/NR_MAC_gNB
+  ${CMAKE_SOURCE_DIR}/openair2/LAYER2/NR_MAC_gNB/slice_prb_allocator
+)
+target_compile_definitions(ran_func_kpm_slice_test PRIVATE
+  ${E2AP_VERSION}
+  ${KPM_VERSION}
+  NGRAN_GNB_DU
+  NGRAN_GNB_CUCP
+  NGRAN_GNB_CUUP
+)
+target_link_libraries(ran_func_kpm_slice_test PRIVATE asn1_nr_rrc_hdrs asn1_lte_rrc_hdrs ds pthread m)
+add_dependencies(tests ran_func_kpm_slice_test)
+add_test(NAME ran_func_kpm_slice_test COMMAND ran_func_kpm_slice_test)

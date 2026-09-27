@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "nr_pdcp_security_nea2.h"
 #include "nr_pdcp_security_nea1.h"
@@ -24,6 +25,27 @@
 int nr_max_pdcp_pdu_size(sdu_size_t sdu_size)
 {
   return (sdu_size + LONG_PDCP_HEADER_SIZE + PDCP_INTEGRITY_SIZE);
+}
+
+/* First and last SDU in the window since the previous consume. 0 means unset. */
+static void pdcp_note_sdu_activity(uint64_t *first_ms, uint64_t *last_ms)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return;
+  uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+  if (now == 0)
+    now = 1;
+  if (*first_ms == 0)
+    *first_ms = now;
+  *last_ms = now;
+}
+
+static void pdcp_count_ul_sdu(nr_pdcp_entity_t *entity, uint32_t size)
+{
+  entity->stats.txsdu_pkts++;
+  entity->stats.txsdu_bytes += size;
+  pdcp_note_sdu_activity(&entity->stats.ul_sdu_first_ms, &entity->stats.ul_sdu_last_ms);
 }
 
 static void nr_pdcp_entity_recv_pdu(nr_pdcp_entity_t *entity,
@@ -176,8 +198,7 @@ static void nr_pdcp_entity_recv_pdu(nr_pdcp_entity_t *entity,
                           &cur->msg_integrity);
       entity->rx_list = cur->next;
       entity->rx_size -= cur->size;
-      entity->stats.txsdu_pkts++;
-      entity->stats.txsdu_bytes += cur->size;
+      pdcp_count_ul_sdu(entity, cur->size);
 
       nr_pdcp_free_sdu(cur);
       count++;
@@ -229,6 +250,7 @@ static int nr_pdcp_entity_process_sdu(nr_pdcp_entity_t *entity,
 
   entity->stats.rxsdu_pkts++;
   entity->stats.rxsdu_bytes += size;
+  pdcp_note_sdu_activity(&entity->stats.dl_sdu_first_ms, &entity->stats.dl_sdu_last_ms);
 
 
   count = entity->tx_next;
@@ -413,8 +435,7 @@ static void check_t_reordering(nr_pdcp_entity_t *entity)
                         &cur->msg_integrity);
     entity->rx_list = cur->next;
     entity->rx_size -= cur->size;
-    entity->stats.txsdu_pkts++;
-    entity->stats.txsdu_bytes += cur->size;
+    pdcp_count_ul_sdu(entity, cur->size);
     nr_pdcp_free_sdu(cur);
   }
 
@@ -427,8 +448,7 @@ static void check_t_reordering(nr_pdcp_entity_t *entity)
                         &cur->msg_integrity);
     entity->rx_list = cur->next;
     entity->rx_size -= cur->size;
-    entity->stats.txsdu_pkts++;
-    entity->stats.txsdu_bytes += cur->size;
+    pdcp_count_ul_sdu(entity, cur->size);
     nr_pdcp_free_sdu(cur);
     count++;
   }
@@ -458,8 +478,7 @@ static void deliver_all_sdus(nr_pdcp_entity_t *entity)
                         &cur->msg_integrity);
     entity->rx_list = cur->next;
     entity->rx_size -= cur->size;
-    entity->stats.txsdu_pkts++;
-    entity->stats.txsdu_bytes += cur->size;
+    pdcp_count_ul_sdu(entity, cur->size);
     nr_pdcp_free_sdu(cur);
   }
 }
